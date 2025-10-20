@@ -46,22 +46,6 @@ export default function App() {
       logLine(`Extracted text preview: "${docText.substring(0, 200)}..."`);
       logLine(`Text length: ${docText.length}`);
       
-      // Debug: Check for specific values that are failing
-      const testValues = ["Dr. Andreas König", "philipp.lehmann@kundenmail.de", "X4843942"];
-      testValues.forEach(val => {
-        const found = docText.includes(val);
-        logLine(`Text contains "${val}": ${found}`);
-      });
-      
-      // Debug: Check spacing around specific words
-      const spacingTest = "Dr. Andreas König";
-      const index = docText.indexOf(spacingTest);
-      if (index !== -1) {
-        const before = docText.substring(Math.max(0, index - 10), index);
-        const after = docText.substring(index + spacingTest.length, index + spacingTest.length + 10);
-        logLine(`Spacing around "${spacingTest}": before="${before}" after="${after}"`);
-      }
-
       // Read JSON (keep exact string for the JSON REVIEWED doc)
       logLine("Reading JSON…");
       const jsonText = await readFileAsText(jsonFile);

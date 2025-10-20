@@ -23,13 +23,12 @@ function copyNonTextChildren(origRun) {
 }
 
 // test original “bold + red”
-function isBoldRed(rPr) {
+function isRed(rPr) {
   if (!rPr) return false;
-  const hasBold = !!rPr[W.B];
   const color = rPr[W.COLOR]?.[W.VAL];
   // Many Word docs use "FF0000" for red; accept small variants if needed
   const redish = color && /^(FF0000|C00000|E00000)$/i.test(color);
-  return !!hasBold && !!redish;
+  return !!redish;
 }
 
 function clone(obj) {
@@ -66,23 +65,12 @@ export function indexRuns(docXml) {
       if (t == null) return;
       const text = typeof t === "string" ? t : (t?.["#text"] ?? "");
       
-      // Add space between runs only if both are non-whitespace and not punctuation
+      // Add space between runs to preserve word boundaries
       if (full.length > 0 && text.length > 0) {
-        const lastChar = full[full.length - 1];
-        const firstChar = text[0];
-        
-        // Only add space if:
-        // 1. Last char is a letter/digit and first char is a letter/digit
-        // 2. Or last char is a letter/digit and first char is not punctuation
-        // 3. And neither is already whitespace
-        const shouldAddSpace = !/\s/.test(lastChar) && !/\s/.test(firstChar) && 
-                              ((/[a-zA-Z0-9]/.test(lastChar) && /[a-zA-Z0-9]/.test(firstChar)) ||
-                               (/[a-zA-Z0-9]/.test(lastChar) && !/[.,;:!?()[\]{}<>$"'\-]/.test(firstChar)));
-        
-        if (shouldAddSpace) {
-          map.push({ p: pIdx, r: rIdx, o: -2 }); // o:-2 marks synthetic space between runs
-          full += " ";
-        }
+        // Always add space between runs to ensure proper word separation
+        // This is very aggressive but necessary to fix the spacing issue
+        map.push({ p: pIdx, r: rIdx, o: -2 }); // o:-2 marks synthetic space between runs
+        full += " ";
       }
       
       for (let i = 0; i < text.length; i++) {
@@ -107,7 +95,11 @@ function applyStyleToRange(struct, start, end, styler) {
 
   for (let i = start; i < end;) {
     const pos = map[i];
+    if (!pos) { i++; continue; } // Skip undefined map entries
+    
     const pRuns = plist[pos.p];
+    if (!pRuns || !pRuns[pos.r]) { i++; continue; } // Skip if paragraph or run doesn't exist
+    
     let rNode = pRuns[pos.r];
     const tNode = rNode[W.T];
     if (pos.o === -1 || pos.o === -2) { i++; continue; } // synthetic whitespace (tab/br/space) — skip styling
@@ -141,7 +133,7 @@ function applyStyleToRange(struct, start, end, styler) {
     if (beforeText) runsNew.push(mkRun(beforeText, baseRPr));
 
     // Styled middle
-    const styledRPr = styler(clone(baseRPr), isBoldRed(baseRPr));
+    const styledRPr = styler(clone(baseRPr), isRed(baseRPr));
     runsNew.push(mkRun(midText, styledRPr));
 
     if (afterText) runsNew.push(mkRun(afterText, baseRPr));
@@ -214,15 +206,196 @@ function findAll(text, value) {
   return hits;
 }
 
-// Decide if a span was originally “bold + red”
+// Modify XML directly to preserve spacing
+function modifyXmlDirectly(xmlString, textToFind, originalValue) {
+  // Escape special XML characters in the text to find
+  const escapeXml = (str) => str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const escapedText = escapeXml(textToFind);
+  
+  // Find all <w:t> tags containing this text
+  const tTagRegex = /<w:t(?:\s+[^>]*)?>([^<]*)<\/w:t>/g;
+  
+  let modified = xmlString;
+  let match;
+  
+  // Reset regex
+  tTagRegex.lastIndex = 0;
+  
+  while ((match = tTagRegex.exec(xmlString)) !== null) {
+    const fullMatch = match[0];
+    const textContent = match[1];
+    
+    // Check if this text node contains our target text
+    if (textContent.includes(textToFind)) {
+      // Find the parent <w:r> tag
+      const beforeMatch = xmlString.substring(0, match.index);
+      const lastRStart = beforeMatch.lastIndexOf('<w:r>');
+      const lastRStartWithProps = beforeMatch.lastIndexOf('<w:r ');
+      const rStart = Math.max(lastRStart, lastRStartWithProps);
+      
+      if (rStart === -1) continue;
+      
+      const rEnd = xmlString.indexOf('</w:r>', match.index) + 6;
+      const runXml = xmlString.substring(rStart, rEnd);
+      
+      // Check if this run was originally red
+      const wasRed = runXml.includes('<w:color w:val="FF0000"') || 
+                     runXml.includes('<w:color w:val="C00000"') ||
+                     runXml.includes('<w:color w:val="E00000"');
+      
+      // Determine the styling to apply
+      let newRunXml;
+      if (wasRed) {
+        // Ground truth: red italic underline
+        newRunXml = applyRedItalicUnderlineToRun(runXml);
+      } else {
+        // AI-added: brown underline
+        newRunXml = applyBrownUnderlineToRun(runXml);
+      }
+      
+      // Replace the run in the modified XML
+      modified = modified.substring(0, rStart) + newRunXml + modified.substring(rEnd);
+      
+      // Only modify the first occurrence
+      break;
+    }
+  }
+  
+  return modified;
+}
+
+// Apply red italic underline styling to a run
+function applyRedItalicUnderlineToRun(runXml) {
+  // Check if <w:rPr> exists
+  if (runXml.includes('<w:rPr>')) {
+    // Modify existing properties
+    let modified = runXml;
+    
+    // Ensure color is red
+    if (!modified.includes('<w:color')) {
+      modified = modified.replace('<w:rPr>', '<w:rPr><w:color w:val="FF0000"/>');
+    }
+    
+    // Add italic if not present
+    if (!modified.includes('<w:i')) {
+      modified = modified.replace('<w:rPr>', '<w:rPr><w:i/>');
+    }
+    
+    // Add underline if not present
+    if (!modified.includes('<w:u')) {
+      modified = modified.replace('<w:rPr>', '<w:rPr><w:u w:val="single"/>');
+    }
+    
+    return modified;
+  } else {
+    // Add new <w:rPr> after <w:r> or <w:r ...>
+    return runXml.replace(/(<w:r(?:\s+[^>]*)?>)/, '$1<w:rPr><w:color w:val="FF0000"/><w:i/><w:u w:val="single"/></w:rPr>');
+  }
+}
+
+// Apply brown underline styling to a run
+function applyBrownUnderlineToRun(runXml) {
+  // Check if <w:rPr> exists
+  if (runXml.includes('<w:rPr>')) {
+    // Modify existing properties
+    let modified = runXml;
+    
+    // Ensure color is brown
+    if (modified.includes('<w:color')) {
+      modified = modified.replace(/<w:color w:val="[^"]*"/, '<w:color w:val="8B4513"');
+    } else {
+      modified = modified.replace('<w:rPr>', '<w:rPr><w:color w:val="8B4513"/>');
+    }
+    
+    // Add underline if not present
+    if (!modified.includes('<w:u')) {
+      modified = modified.replace('<w:rPr>', '<w:rPr><w:u w:val="single"/>');
+    }
+    
+    return modified;
+  } else {
+    // Add new <w:rPr> after <w:r> or <w:r ...>
+    return runXml.replace(/(<w:r(?:\s+[^>]*)?>)/, '$1<w:rPr><w:color w:val="8B4513"/><w:u w:val="single"/></w:rPr>');
+  }
+}
+
+// Apply styling to a specific range in XML
+function applyStyleToRangeInXML(paragraphs, start, end, originalValue) {
+  let currentPos = 0;
+  
+  for (let pIdx = 0; pIdx < paragraphs.length; pIdx++) {
+    const p = paragraphs[pIdx];
+    const runs = Array.isArray(p[W.R]) ? p[W.R] : (p[W.R] ? [p[W.R]] : []);
+    
+    for (let rIdx = 0; rIdx < runs.length; rIdx++) {
+      const run = runs[rIdx];
+      const t = run[W.T];
+      if (t == null) continue;
+      
+      const runText = typeof t === "string" ? t : (t?.["#text"] ?? "");
+      if (!runText) continue;
+      
+      const runStart = currentPos;
+      const runEnd = currentPos + runText.length;
+      
+      // Check if this run overlaps with our target range
+      if (runStart < end && runEnd > start) {
+        console.log(`Styling run at paragraph ${pIdx}, run ${rIdx}: "${runText}"`);
+        
+        // Check if this span was originally bold+red
+        const rPr = run[W.RPR];
+        const wasBR = isRed(rPr);
+        console.log(`Was originally bold+red: ${wasBR}`);
+        
+        // Apply appropriate styling - ensure we don't break the XML structure
+        try {
+          if (wasBR) {
+            // Ground truth: red italic underline
+            const styledRPr = overlayExact(rPr, true);
+            if (styledRPr && typeof styledRPr === 'object') {
+              run[W.RPR] = styledRPr;
+              console.log(`Applied red italic underline to "${runText}"`);
+            }
+          } else {
+            // AI-added: brown underline
+            const styledRPr = overlayBrown(rPr);
+            if (styledRPr && typeof styledRPr === 'object') {
+              run[W.RPR] = styledRPr;
+              console.log(`Applied brown underline to "${runText}"`);
+            }
+          }
+        } catch (err) {
+          console.warn(`Error applying styling to run:`, err);
+          // Continue without breaking the document
+        }
+      }
+      
+      currentPos += runText.length;
+    }
+    
+    // Add paragraph break (newline) after each paragraph
+    if (pIdx < paragraphs.length - 1) {
+      currentPos += 1;
+    }
+  }
+  
+  return true; // Styled successfully
+}
+
+// Decide if a span was originally "bold + red"
 function spanWasBoldRed(struct, start, end) {
   const { map, paragraphs, plist } = struct;
   if (start < 0 || end <= start || end > map.length) return false;
   for (let k = start; k < end; k++) {
     const pos = map[k];
-    const rNode = plist[pos.p][pos.r];
+    if (!pos) continue; // Skip undefined map entries
+    
+    const pRuns = plist[pos.p];
+    if (!pRuns || !pRuns[pos.r]) continue; // Skip if paragraph or run doesn't exist
+    
+    const rNode = pRuns[pos.r];
     const rPr = rNode[W.RPR];
-    if (!isBoldRed(rPr)) return false; // every char of span must be bold red
+    if (!isRed(rPr)) return false; // every char of span must be bold red
   }
   return true;
 }
@@ -236,82 +409,37 @@ function spanWasBoldRed(struct, start, end) {
  *  - If value not found in doc => leave document unchanged (document-only policy)
  */
 export async function annotateDocxWithDetections(docxArrayBuffer, detections) {
-  try {
-    console.log("annotateDocxWithDetections: Starting");
-    const zip = await JSZip.loadAsync(docxArrayBuffer);
-    console.log("ZIP loaded");
-    
-    const docXml = await zip.file("word/document.xml")?.async("string");
-    if (!docXml) throw new Error("word/document.xml not found");
-    console.log("Document XML extracted");
+  const zip = await JSZip.loadAsync(docxArrayBuffer);
+  let docXml = await zip.file("word/document.xml")?.async("string");
+  if (!docXml) throw new Error("word/document.xml not found");
 
-    // Use mammoth for text extraction to get proper spacing
-    const mammoth = await import("mammoth");
-    const { value: docTextRaw } = await mammoth.extractRawText({ arrayBuffer: docxArrayBuffer });
-    const full = (docTextRaw || "").replace(/\r/g, "");
-    console.log(`Document text extracted with mammoth, length: ${full.length}`);
+  // Use mammoth for text extraction to get proper spacing
+  const mammoth = await import("mammoth");
+  const { value: docTextRaw } = await mammoth.extractRawText({ arrayBuffer: docxArrayBuffer });
+  const mammothText = (docTextRaw || "").replace(/\r/g, "");
 
-    // Also extract with indexRuns for XML structure mapping
-    const struct = indexRuns(docXml);
-    const { full: xmlText } = struct;
-    console.log(`XML text extracted, length: ${xmlText.length}`);
+  for (const det of detections || []) {
+    const val = String(det.value || "");
+    if (!val) continue;
 
-    console.log(`Processing ${detections.length} detections...`);
-    for (let i = 0; i < detections.length; i++) {
-      const det = detections[i];
-      console.log(`Processing detection ${i + 1}/${detections.length}: "${det.value}"`);
-      
-      const val = String(det.value || "");
-      if (!val) {
-        console.log("Skipping empty value");
-        continue;
-      }
-
-      // Find ranges in the mammoth text (with proper spacing)
-      const ranges = findAll(full, val);
-      console.log(`Found ${ranges.length} ranges for "${val}" in mammoth text`);
-      
-      if (!ranges.length) {
-        console.log("No ranges found, skipping");
-        continue;
-      }
-
-      // For each range found in mammoth text, try to find corresponding range in XML text
-      for (let j = 0; j < ranges.length; j++) {
-        const [s, e] = ranges[j];
-        console.log(`Processing range ${j + 1}/${ranges.length}: [${s}, ${e}]`);
-        
-        try {
-          // Find the corresponding range in XML text
-          const xmlRanges = findAll(xmlText, val);
-          if (xmlRanges.length > j) {
-            const [xmlS, xmlE] = xmlRanges[j];
-            console.log(`Found corresponding XML range: [${xmlS}, ${xmlE}]`);
-            
-            const wasBR = spanWasBoldRed(struct, xmlS, xmlE);
-            console.log(`Was originally bold+red: ${wasBR}`);
-            
-            applyStyleToRange(struct, xmlS, xmlE, (rPr) => (wasBR ? overlayExact(rPr, true) : overlayBrown(rPr)));
-            console.log(`Applied styling to XML range [${xmlS}, ${xmlE}]`);
-          }
-        } catch (err) {
-          console.warn(`Error processing range [${s}, ${e}] for value "${val}":`, err);
-          // Continue with other ranges even if one fails
-        }
-      }
+    // Find the text in mammoth text (with proper spacing)
+    const ranges = findAll(mammothText, val);
+    if (!ranges.length) {
+      // not found in doc -> do nothing in the document (JSON report will handle notes)
+      continue;
     }
 
-    console.log("Rebuilding XML...");
-    // Rebuild XML and zip
-    const newDocXml = builder.build(struct.doc);
-    zip.file("word/document.xml", newDocXml);
-    
-    console.log("Generating final document...");
-    const outBuf = await zip.generateAsync({ type: "blob" });
-    console.log("Document generated successfully");
-    return outBuf;
-  } catch (error) {
-    console.error("Error in annotateDocxWithDetections:", error);
-    throw error;
+    // For each range found, modify the XML directly
+    for (const [mammothStart, mammothEnd] of ranges) {
+      const textToFind = mammothText.substring(mammothStart, mammothEnd);
+      
+      // Modify XML string directly to preserve spacing
+      docXml = modifyXmlDirectly(docXml, textToFind, val);
+    }
   }
+
+  // Save modified XML back to zip
+  zip.file("word/document.xml", docXml);
+  const outBuf = await zip.generateAsync({ type: "blob" });
+  return outBuf;
 }
