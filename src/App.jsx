@@ -1,14 +1,12 @@
 import React, { useState } from "react";
-import mammoth from "mammoth";
 import { saveAs } from "file-saver";
-import JSZip from "jszip";
-import { readFileAsArrayBuffer, readFileAsText, evaluateDetections } from "./eval.js";
-import { makeReviewedDocumentDocx, makeReviewedJsonDocx } from "./builders.js";
-import { readDefaultFontSizeHalfPtsFromDocx } from "./docx-font.js"; // NEW
-import { annotateDocxWithDetections, indexRuns } from "./openxml-edit.js";
+import { readFileAsText } from "./eval.js";
+import { detectFileType, extractTextFromFile, isImageFile } from "./file-processor.js";
+import { maskDocx, maskDoc, maskPdf } from "./text-masker.js";
+import { maskImage, maskScannedPdf } from "./image-masker.js";
 
 export default function App() {
-  const [docxFile, setDocxFile] = useState(null);
+  const [originalFile, setOriginalFile] = useState(null);
   const [jsonFile, setJsonFile] = useState(null);
   const [busy, setBusy] = useState(false);
   const [log, setLog] = useState("");
@@ -16,8 +14,8 @@ export default function App() {
   const logLine = (m) => setLog((s) => (s ? s + "\n" : "") + m);
 
   const onGenerate = async () => {
-    if (!docxFile || !jsonFile) {
-      alert("Please upload a .docx (original) and a .json (PII detections).");
+    if (!originalFile || !jsonFile) {
+      alert("Please upload an original file (DOC/DOCX/PDF/Image) and a JSON file with PII detections.");
       return;
     }
     setBusy(true);
@@ -30,68 +28,74 @@ export default function App() {
     }, 30000);
 
     try {
-      // Read DOCX binary
-      logLine("Reading DOCX…");
-      const ab = await readFileAsArrayBuffer(docxFile);
+      // Detect file type
+      logLine("Detecting file type…");
+      const fileType = detectFileType(originalFile);
+      logLine(`File type detected: ${fileType.type}`);
 
-      // Get original default font size from styles.xml
-      const defaultHalfPts = await readDefaultFontSizeHalfPtsFromDocx(ab);
-      if (defaultHalfPts) logLine(`Original default font size (half-points): ${defaultHalfPts}`);
-
-      // Extract text using mammoth for better text extraction
-      const { value: docTextRaw } = await mammoth.extractRawText({ arrayBuffer: ab });
-      const docText = (docTextRaw || "").replace(/\r/g, "");
-      
-      // Debug: Log the extracted text to see if it matches the original
-      logLine(`Extracted text preview: "${docText.substring(0, 200)}..."`);
-      logLine(`Text length: ${docText.length}`);
-      
-      // Read JSON (keep exact string for the JSON REVIEWED doc)
-      logLine("Reading JSON…");
+      // Read JSON detections
+      logLine("Reading JSON detections…");
       const jsonText = await readFileAsText(jsonFile);
-      logLine("JSON read successfully");
       const parsed = JSON.parse(jsonText);
-      logLine("JSON parsed successfully");
       const detections = Array.isArray(parsed?.pii)
         ? parsed.pii.map((x) => ({ type: x.type, value: String(x.value ?? "") }))
         : [];
-      logLine(`Text length: ${docText.length}, detections: ${detections.length}`);
+      logLine(`Found ${detections.length} PII detections`);
 
-      // Simplified evaluation - just mark everything as matched for now
-      logLine("Starting simplified evaluation...");
-      const evalResult = {
-        matched: detections.map(d => ({ det: d, hits: [{ start: 0, end: 10 }], status: 'exact' })),
-        notFound: [],
-        partials: [],
-        duplicates: [],
-        occurrences: new Map(),
-        notes: new Map()
-      };
-      logLine("Simplified evaluation completed");
-      logLine(
-        `Matched: ${evalResult.matched.length}, Not found: ${evalResult.notFound.length}, Partials: ${evalResult.partials.length}, Duplicates: ${evalResult.duplicates.length}`
-      );
+      // Extract text and determine masking approach
+      logLine("Extracting text from file…");
+      const { text, fileType: detectedType, isScanned } = await extractTextFromFile(originalFile);
+      logLine(`Extracted text length: ${text.length}`);
+      logLine(`Is scanned document: ${isScanned}`);
 
-      // Build the two reports
-      logLine("Building REVIEWED DOCX…");
-      const reviewedDocBlob = await annotateDocxWithDetections(ab, detections);
-      // ^ 'ab' is the ArrayBuffer of the original DOCX we already read
+      // Generate masked file based on file type
+      let maskedBlob;
+      const originalArrayBuffer = await originalFile.arrayBuffer();
 
-      logLine("Building REVIEWED JSON…");
-      const reviewedJsonBlob = await makeReviewedJsonDocx({
-        jsonName: jsonFile.name.replace(/\.json$/i, ""),
-        originalJsonText: jsonText,   // unchanged JSON string
-        detections,
-        evalResult,
-        // defaultFontHalfPts optional; not needed here since we render verbatim JSON
-      });
+      if (isScanned || isImageFile(originalFile)) {
+        // Use image masking (black rectangles)
+        logLine("Applying image masking (black rectangles)…");
+        if (fileType.type === 'pdf') {
+          maskedBlob = await maskScannedPdf(originalArrayBuffer, detections);
+        } else {
+          maskedBlob = await maskImage(originalFile, detections);
+        }
+      } else {
+        // Use text masking (replace with 'x' characters)
+        logLine("Applying text masking (replace with 'x' characters)…");
+        switch (fileType.type) {
+          case 'docx':
+            maskedBlob = await maskDocx(originalArrayBuffer, detections);
+            break;
+          case 'doc':
+            maskedBlob = await maskDoc(originalArrayBuffer, detections);
+            break;
+          case 'pdf':
+            maskedBlob = await maskPdf(originalArrayBuffer, detections, text);
+            break;
+          default:
+            throw new Error(`Unsupported file type for text masking: ${fileType.type}`);
+        }
+      }
 
-      logLine("Downloading files…");
-      // Download
-      saveAs(reviewedDocBlob, docxFile.name.replace(/\.docx$/i, "") + " REVIEWED.docx");
-      saveAs(reviewedJsonBlob, jsonFile.name.replace(/\.json$/i, "") + ".REVIEWED.docx");
+      // Generate output filename
+      const originalName = originalFile.name;
+      const nameWithoutExt = originalName.replace(/\.[^/.]+$/, "");
+      const extension = originalName.split('.').pop().toLowerCase();
+      
+      let outputExtension;
+      if (fileType.type === 'image') {
+        outputExtension = 'png'; // Images are converted to PNG
+      } else {
+        outputExtension = extension; // Keep original extension for documents
+      }
 
-      logLine("✅ Done — both reports downloaded.");
+      const outputFileName = `${nameWithoutExt}_MASKED.${outputExtension}`;
+
+      logLine("Downloading masked file…");
+      saveAs(maskedBlob, outputFileName);
+
+      logLine("✅ Done — masked file downloaded.");
     } catch (e) {
       console.error(e);
       logLine("❌ " + (e?.message || e));
@@ -105,16 +109,27 @@ export default function App() {
   return (
     <div style={{ minHeight: "100vh", background: "#f7fafc", padding: 24 }}>
       <div style={{ maxWidth: 900, margin: "0 auto", background: "#fff", borderRadius: 16, boxShadow: "0 6px 20px rgba(0,0,0,0.06)", padding: 24 }}>
-        <h1 style={{ fontSize: 22, marginBottom: 6 }}>PII Detection Reviewer</h1>
+        <h1 style={{ fontSize: 22, marginBottom: 6 }}>PII Masking Tool</h1>
+        <p style={{ fontSize: 14, color: "#718096", marginBottom: 20 }}>
+          Upload a document (DOC/DOCX/PDF) or image, and a JSON file with PII detections to create a masked version.
+        </p>
         <div style={{ display: "grid", gap: 12 }}>
           <div>
-            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>Original DOCX</div>
-            <input type="file" accept=".docx" onChange={(e) => setDocxFile(e.target.files?.[0] || null)} />
-            {docxFile && <div style={{ fontSize: 12, color: "#718096", marginTop: 4 }}>Selected: {docxFile.name}</div>}
+            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>Original File</div>
+            <input 
+              type="file" 
+              accept=".doc,.docx,.pdf,.jpg,.jpeg,.png,.gif,.bmp,.tiff,.webp" 
+              onChange={(e) => setOriginalFile(e.target.files?.[0] || null)} 
+            />
+            {originalFile && (
+              <div style={{ fontSize: 12, color: "#718096", marginTop: 4 }}>
+                Selected: {originalFile.name} ({detectFileType(originalFile)?.type || 'unknown'})
+              </div>
+            )}
           </div>
 
           <div>
-            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>Detections JSON</div>
+            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>PII Detections JSON</div>
             <input type="file" accept=".json" onChange={(e) => setJsonFile(e.target.files?.[0] || null)} />
             {jsonFile && <div style={{ fontSize: 12, color: "#718096", marginTop: 4 }}>Selected: {jsonFile.name}</div>}
           </div>
@@ -132,7 +147,7 @@ export default function App() {
               cursor: busy ? "not-allowed" : "pointer"
             }}
           >
-            {busy ? "Working…" : "Generate Reports"}
+            {busy ? "Masking…" : "Generate Masked File"}
           </button>
         </div>
 
