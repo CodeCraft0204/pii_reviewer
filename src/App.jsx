@@ -71,7 +71,7 @@ export default function App() {
             maskedBlob = await maskDoc(originalArrayBuffer, detections);
             break;
           case 'pdf':
-            maskedBlob = await maskPdf(originalArrayBuffer, detections, text);
+            maskedBlob = await maskPdf(originalArrayBuffer, detections, text, 'rectangle'); // Use 'rectangle' or 'text' for masking method
             break;
           default:
             throw new Error(`Unsupported file type for text masking: ${fileType.type}`);

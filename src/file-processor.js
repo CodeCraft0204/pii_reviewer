@@ -3,10 +3,10 @@
  */
 
 import mammoth from "mammoth";
-import * as pdfjsLib from "pdfjs-dist";
+import * as pdfjsLib from 'pdfjs-dist';
 
-// Set up PDF.js worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+// Disable worker for simpler setup
+pdfjsLib.GlobalWorkerOptions.workerSrc = '';
 
 /**
  * Detect file type from file object
@@ -73,27 +73,49 @@ export async function extractTextFromDoc(arrayBuffer) {
  * @returns {Promise<{text: string, isScanned: boolean}>} - Extracted text and whether it's a scanned PDF
  */
 export async function extractTextFromPdf(arrayBuffer) {
-  const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
-  const pdf = await loadingTask.promise;
-  
-  let fullText = "";
-  let totalChars = 0;
-  
-  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-    const page = await pdf.getPage(pageNum);
-    const textContent = await page.getTextContent();
-    const pageText = textContent.items.map(item => item.str).join(' ');
-    fullText += pageText + '\n';
-    totalChars += pageText.length;
+  try {
+    console.log('Extracting text from PDF...');
+    
+    const uint8Array = new Uint8Array(arrayBuffer);
+    const loadingTask = pdfjsLib.getDocument({
+      data: uint8Array,
+      useSystemFonts: true,
+      disableWorker: true,
+    });
+    
+    const pdfDoc = await loadingTask.promise;
+    
+    let fullText = '';
+    const numPages = pdfDoc.numPages;
+    
+    console.log(`Extracting text from ${numPages} pages...`);
+    
+    for (let i = 1; i <= numPages; i++) {
+      const page = await pdfDoc.getPage(i);
+      const textContent = await page.getTextContent();
+      const pageText = textContent.items.map(item => item.str).join('');
+      fullText += pageText + '\n\n';
+    }
+    
+    // Heuristic: if very little text extracted, it's likely a scanned PDF
+    const isScanned = fullText.trim().length < 100 && numPages > 0;
+    
+    console.log(`Extracted ${fullText.length} characters, isScanned: ${isScanned}`);
+    
+    await pdfDoc.destroy();
+    
+    return {
+      text: fullText.trim(),
+      isScanned
+    };
+  } catch (error) {
+    console.error('Error extracting text from PDF:', error);
+    // Return empty text and mark as scanned to fall back to image masking
+    return {
+      text: '',
+      isScanned: true
+    };
   }
-  
-  // Heuristic: if very little text extracted, it's likely a scanned PDF
-  const isScanned = totalChars < 100 && pdf.numPages > 0;
-  
-  return {
-    text: fullText.trim(),
-    isScanned
-  };
 }
 
 /**
