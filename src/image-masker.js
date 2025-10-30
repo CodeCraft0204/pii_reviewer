@@ -5,6 +5,7 @@
 
 import { PDFDocument, rgb } from "pdf-lib";
 import * as pdfjsLib from "pdfjs-dist";
+import { createWorker } from 'tesseract.js';
 
 // Set up PDF.js worker
 pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
@@ -18,40 +19,37 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.j
 export async function maskImage(imageFile, detections) {
   // Load image
   const img = await loadImageFromFile(imageFile);
-  
+
   // Create canvas
   const canvas = document.createElement('canvas');
   canvas.width = img.width;
   canvas.height = img.height;
   const ctx = canvas.getContext('2d');
-  
+
   // Draw original image
   ctx.drawImage(img, 0, 0);
-  
-  // For images, we need OCR to find text positions
-  // Since we don't have OCR in the browser, we'll use a heuristic approach:
-  // Draw black rectangles based on estimated text positions
-  
-  // Simple approach: draw rectangles at common document positions
-  // In production, you'd use Tesseract.js or similar for OCR
-  const textHeight = 20;
-  const padding = 5;
-  
-  // For now, we'll mask the entire image with a pattern
-  // In production, you'd use OCR to find exact positions
-  ctx.fillStyle = 'black';
-  
-  // Draw black rectangles over detected areas
-  // This is a placeholder - in production, use OCR to find exact positions
-  for (let i = 0; i < detections.length; i++) {
-    const y = 50 + (i * 30); // Simple vertical stacking
-    const x = 50;
-    const width = 300; // Estimated width
-    
-    ctx.fillRect(x - padding, y - textHeight + padding, width + (padding * 2), textHeight + padding);
+
+  // Try OCR-based masking for precise alignment
+  try {
+    const boxes = await extractBoxesWithTesseract(img, detections);
+    ctx.fillStyle = 'black';
+    for (const b of boxes) {
+      ctx.fillRect(b.x - 2, b.y - 2, b.width + 4, b.height + 4);
+    }
+  } catch (err) {
+    console.warn('OCR masking failed, falling back to heuristic rectangles:', err);
+    // Fallback: draw rough rectangles (previous behavior)
+    ctx.fillStyle = 'black';
+    const textHeight = 20;
+    const padding = 5;
+    for (let i = 0; i < detections.length; i++) {
+      const y = 50 + (i * 30);
+      const x = 50;
+      const width = 300;
+      ctx.fillRect(x - padding, y - textHeight + padding, width + (padding * 2), textHeight + padding);
+    }
   }
-  
-  // Convert canvas to blob
+
   return new Promise((resolve, reject) => {
     canvas.toBlob((blob) => {
       if (blob) {
@@ -61,6 +59,129 @@ export async function maskImage(imageFile, detections) {
       }
     }, 'image/png');
   });
+}
+
+// Run Tesseract to get word boxes and map detections to boxes
+async function extractBoxesWithTesseract(imgElement, detections) {
+  // Prepare worker (French + English improves accuracy on FR IDs)
+  const worker = await createWorker('eng+fra');
+  try {
+    // Recognize directly from canvas to avoid re-encoding
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = imgElement.width;
+    tempCanvas.height = imgElement.height;
+    const tctx = tempCanvas.getContext('2d');
+    tctx.drawImage(imgElement, 0, 0);
+
+    const { data } = await worker.recognize(tempCanvas);
+    const words = data?.words || [];
+
+    // Index words by order with normalized text
+    const normalized = (s) => s
+      .normalize('NFKD')
+      .replace(/\p{Diacritic}+/gu, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+
+    const wordList = words.map(w => ({
+      text: w.text || '',
+      ntext: normalized(w.text || ''),
+      bbox: { x: w.bbox.x0, y: w.bbox.y0, width: w.bbox.x1 - w.bbox.x0, height: w.bbox.y1 - w.bbox.y0 }
+    }));
+
+    const boxes = [];
+
+    // Token-level matcher with strict rules: digits exact, short words exact, longer words allow 1 edit
+    const levenshtein = (a, b) => {
+      const m = a.length, n = b.length;
+      const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+      for (let i = 0; i <= m; i++) dp[i][0] = i;
+      for (let j = 0; j <= n; j++) dp[0][j] = j;
+      for (let i = 1; i <= m; i++) {
+        for (let j = 1; j <= n; j++) {
+          const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+          dp[i][j] = Math.min(
+            dp[i - 1][j] + 1,
+            dp[i][j - 1] + 1,
+            dp[i - 1][j - 1] + cost
+          );
+        }
+      }
+      return dp[m][n];
+    };
+
+    const tokensMatchStrict = (windowTokens, targetTokens) => {
+      if (windowTokens.length !== targetTokens.length) return false;
+      for (let t = 0; t < targetTokens.length; t++) {
+        const tgt = targetTokens[t];
+        const win = windowTokens[t];
+        const hasDigit = /\d/.test(tgt) || /\d/.test(win);
+        if (hasDigit || tgt.length <= 3) {
+          if (win !== tgt) return false; // exact for digits and very short tokens
+        } else {
+          const dist = levenshtein(win, tgt);
+          if (dist > 1) return false; // allow 1 edit for longer alphabetic tokens
+        }
+      }
+      return true;
+    };
+
+    for (const det of detections || []) {
+      const target = normalized(String(det.value || ''));
+      if (!target) continue;
+
+      // Split into tokens; try to match consecutive words with fuzziness
+      const tokens = target.split(' ').filter(Boolean);
+      if (tokens.length === 0) continue;
+
+      // Sliding fuzzy window over word sequence
+      const targetCompact = target.replace(/\s/g, '');
+      for (let i = 0; i < wordList.length; i++) {
+        // Prefer exact token-length windows to avoid overmasking trailing words (e.g., city names)
+        const preferredLens = [tokens.length];
+        for (const wlenRaw of preferredLens) {
+          const wlen = Math.min(wlenRaw, wordList.length - i);
+          const window = wordList.slice(i, i + wlen);
+          const windowText = window.map(w => w.ntext).join(' ');
+          const windowCompact = windowText.replace(/\s/g, '');
+
+          // STRICT, token-aware match: require tokens to match with tight tolerance
+          let isMatch = false;
+          if (windowCompact === targetCompact || tokensMatchStrict(window.map(w => w.ntext), tokens)) {
+            isMatch = true;
+          } else {
+            // Fuzzy fallback for minor OCR slips (max 2 edits), but same token count and same digit sequence
+            const digitsEqual = windowCompact.replace(/\D/g, '') === targetCompact.replace(/\D/g, '');
+            const dist = levenshtein(windowCompact, targetCompact);
+            const ratio = dist / Math.max(1, targetCompact.length);
+            if (digitsEqual && dist <= 2 && ratio <= 0.12) {
+              isMatch = true;
+            }
+          }
+
+          if (isMatch) {
+            // Combine bounding boxes from window
+            let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+            for (const w of window) {
+              const b = w.bbox;
+              x0 = Math.min(x0, b.x);
+              y0 = Math.min(y0, b.y);
+              x1 = Math.max(x1, b.x + b.width);
+              y1 = Math.max(y1, b.y + b.height);
+            }
+            boxes.push({ x: x0, y: y0, width: x1 - x0, height: y1 - y0 });
+            i = i + wlen - 1; // skip ahead
+            break;
+          }
+        }
+      }
+    }
+
+    return boxes;
+  } finally {
+    await worker.terminate();
+  }
 }
 
 /**
